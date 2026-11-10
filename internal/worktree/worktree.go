@@ -82,20 +82,9 @@ func Add(args []string, opts Options) (string, error) {
 		return "", addErr
 	}
 
-	after := git.LinkedWorktrees(src.commonDir)
-	var id string
-	for k := range after {
-		if _, ok := before[k]; !ok {
-			id = k
-			break
-		}
-	}
+	id, dst := newWorktree(before, git.LinkedWorktrees(src.commonDir), args)
 	if id == "" {
 		return "", nil
-	}
-	dst, err := pathutil.Canon(after[id])
-	if err != nil {
-		return "", err
 	}
 	dstIndex := filepath.Join(src.commonDir, "worktrees", id, "index")
 
@@ -112,6 +101,33 @@ func Add(args []string, opts Options) (string, error) {
 	report.Trace(t0, "total")
 	report.Logf("ready: %s", dst)
 	return dst, nil
+}
+
+func newWorktree(before, after map[string]string, args []string) (id, dst string) {
+	wanted := map[string]bool{}
+	for _, a := range args {
+		if c, err := pathutil.Canon(a); err == nil {
+			wanted[c] = true
+		}
+	}
+	var only []string
+	for k, p := range after {
+		if _, ok := before[k]; ok {
+			continue
+		}
+		c, err := pathutil.Canon(p)
+		if err != nil {
+			continue
+		}
+		if wanted[c] {
+			return k, c
+		}
+		only = append(only, k, c)
+	}
+	if len(only) == 2 {
+		return only[0], only[1]
+	}
+	return "", ""
 }
 
 // querySource gathers config, submodules and untracked files from the source.
