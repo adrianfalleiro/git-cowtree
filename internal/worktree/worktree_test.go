@@ -96,6 +96,7 @@ func TestAddMatchesPlainCheckout(t *testing.T) {
 		write(t, filepath.Join(src, "dir", f+".txt"), f+" v1\n")
 	}
 	write(t, filepath.Join(src, "dir", "[x]*.txt"), "glob v1\n") // glob characters in the name
+	write(t, filepath.Join(src, "local.cnf"), "local v1\n")
 	write(t, filepath.Join(src, "vendor", "lib", "keep.js"), "vendored\n")
 	write(t, filepath.Join(src, "top.txt"), "top\n")
 	write(t, filepath.Join(src, ".gitignore"), "ignored/\nworktrees/\n")
@@ -109,6 +110,7 @@ func TestAddMatchesPlainCheckout(t *testing.T) {
 	gitT(t, src, "rm", "-q", "dir/b.txt")
 	write(t, filepath.Join(src, "dir", "c.txt"), "c target\n")
 	write(t, filepath.Join(src, "dir", "n.txt"), "new in target\n")
+	write(t, filepath.Join(src, "local.cnf"), "local target\n")
 	gitT(t, src, "add", "-A")
 	gitT(t, src, "commit", "-q", "-m", "target")
 	gitT(t, src, "checkout", "-q", "main")
@@ -120,6 +122,10 @@ func TestAddMatchesPlainCheckout(t *testing.T) {
 	write(t, filepath.Join(src, "dir", "staged-new.txt"), "brand new\n")
 	gitT(t, src, "add", "dir/staged-new.txt")
 	gitT(t, src, "rm", "-q", "--cached", "dir/d.txt")
+	gitT(t, src, "rm", "-q", "dir/b.txt")
+	gitT(t, src, "update-index", "--skip-worktree", "local.cnf")
+	write(t, filepath.Join(src, "local.cnf"), "local edit git ignores\n")
+	gitT(t, src, "update-index", "--assume-unchanged", "top.txt")
 	os.Remove(filepath.Join(src, "dir", "e.txt"))
 	write(t, filepath.Join(src, "dir", "[x]*.txt"), "glob dirty\n")
 	write(t, filepath.Join(src, "top.txt"), "top dirty\n")
@@ -146,6 +152,11 @@ func TestAddMatchesPlainCheckout(t *testing.T) {
 			// Status straight away, without letting git refresh the index first.
 			if dirty := gitT(t, got, "diff-files", "--name-only"); dirty != "" {
 				t.Errorf("index not trusted for: %s", dirty)
+			}
+			for _, e := range strings.Split(gitT(t, got, "ls-files", "-v"), "\n") {
+				if !strings.HasPrefix(e, "H ") {
+					t.Errorf("index entry kept a flag from the source: %s", e)
+				}
 			}
 			if status := gitT(t, got, "status", "--porcelain"); status != "" {
 				t.Errorf("git status not clean:\n%s", status)
