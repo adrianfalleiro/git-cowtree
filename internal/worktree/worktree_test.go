@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"bytes"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -184,5 +185,28 @@ func TestAddMatchesPlainCheckout(t *testing.T) {
 				t.Errorf("fallback checkout should not copy gitignored files")
 			}
 		})
+	}
+}
+
+func TestNewWorktreePicksRequestedPathAmongConcurrentAdds(t *testing.T) {
+	root, err := pathutil.Canon(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := map[string]string{"old": filepath.Join(root, "old")}
+	after := map[string]string{"old": before["old"]}
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("wt%d", i)
+		if err := os.Mkdir(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		after[name] = filepath.Join(root, name)
+	}
+	t.Chdir(root)
+	for _, want := range []string{"wt3", "wt17"} {
+		id, dst := newWorktree(before, after, []string{"-b", "branch-" + want, want, "main"})
+		if id != want || dst != filepath.Join(root, want) {
+			t.Errorf("args for %s picked %s at %s", want, id, dst)
+		}
 	}
 }
