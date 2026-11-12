@@ -31,8 +31,10 @@ func findRealGit() string {
 	self, _ := os.Executable()
 	self, _ = filepath.EvalSymlinks(self)
 	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		// Skip any shim, not just this binary: a test binary or another
+		// program importing this package isn't the shim's target.
 		resolved, err := filepath.EvalSymlinks(filepath.Join(dir, "git"))
-		if err != nil || resolved == self {
+		if err != nil || resolved == self || filepath.Base(resolved) == "git-cowtree" {
 			continue
 		}
 		if info, err := os.Stat(resolved); err != nil || info.IsDir() || info.Mode()&0o111 == 0 {

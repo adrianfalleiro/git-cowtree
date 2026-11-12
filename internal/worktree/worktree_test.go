@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -137,54 +138,66 @@ func TestAddMatchesPlainCheckout(t *testing.T) {
 
 	t.Chdir(src)
 	cow := clone.Possible(src, root)
-	for _, target := range []string{"main", "target"} {
-		t.Run(target, func(t *testing.T) {
-			got := filepath.Join(root, "cow-"+target)
-			want := filepath.Join(root, "plain-"+target)
-			path, err := Add([]string{"-q", "--detach", got, target}, Options{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if path != got {
-				t.Errorf("Add returned %q, want %q", path, got)
-			}
-			gitT(t, src, "worktree", "add", "-q", "--detach", want, target)
-
-			// Status straight away, without letting git refresh the index first.
-			if dirty := gitT(t, got, "diff-files", "--name-only"); dirty != "" {
-				t.Errorf("index not trusted for: %s", dirty)
-			}
-			for _, e := range strings.Split(gitT(t, got, "ls-files", "-v"), "\n") {
-				if !strings.HasPrefix(e, "H ") {
-					t.Errorf("index entry kept a flag from the source: %s", e)
+	// "full-reset" forces the fallback taken when too many paths differ to
+	// restore one by one.
+	for _, mode := range []string{"targeted", "full-reset"} {
+		for _, target := range []string{"main", "target"} {
+			t.Run(mode+"/"+target, func(t *testing.T) {
+				if mode == "full-reset" {
+					defer func(n int) { maxTrackedFix = n }(maxTrackedFix)
+					maxTrackedFix = -1
 				}
-			}
-			if status := gitT(t, got, "status", "--porcelain"); status != "" {
-				t.Errorf("git status not clean:\n%s", status)
-			}
+				testAddMatchesPlainCheckout(t, src, root, mode, target, cow)
+			})
+		}
+	}
+}
 
-			gotFiles, wantFiles := snapshot(t, got, "ignored"), snapshot(t, want)
-			for p, w := range wantFiles {
-				if g, ok := gotFiles[p]; !ok {
-					t.Errorf("missing %s", p)
-				} else if g != w {
-					t.Errorf("%s = %q, want %q", p, g, w)
-				}
-			}
-			for p := range gotFiles {
-				if _, ok := wantFiles[p]; !ok {
-					t.Errorf("extra file %s", p)
-				}
-			}
+func testAddMatchesPlainCheckout(t *testing.T, src, root, mode, target string, cow bool) {
+	got := filepath.Join(root, "cow-"+mode+"-"+target)
+	want := filepath.Join(root, "plain-"+mode+"-"+target)
+	path, err := Add([]string{"-q", "--detach", got, target}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != got {
+		t.Errorf("Add returned %q, want %q", path, got)
+	}
+	gitT(t, src, "worktree", "add", "-q", "--detach", want, target)
 
-			ignored, err := os.ReadFile(filepath.Join(got, "ignored", "file"))
-			if cow && !bytes.Equal(ignored, []byte("ignored\n")) {
-				t.Errorf("gitignored file not cloned: %q, %v", ignored, err)
-			}
-			if !cow && err == nil {
-				t.Errorf("fallback checkout should not copy gitignored files")
-			}
-		})
+	// Status straight away, without letting git refresh the index first.
+	if dirty := gitT(t, got, "diff-files", "--name-only"); dirty != "" {
+		t.Errorf("index not trusted for: %s", dirty)
+	}
+	for _, e := range strings.Split(gitT(t, got, "ls-files", "-v"), "\n") {
+		if !strings.HasPrefix(e, "H ") {
+			t.Errorf("index entry kept a flag from the source: %s", e)
+		}
+	}
+	if status := gitT(t, got, "status", "--porcelain"); status != "" {
+		t.Errorf("git status not clean:\n%s", status)
+	}
+
+	gotFiles, wantFiles := snapshot(t, got, "ignored"), snapshot(t, want)
+	for p, w := range wantFiles {
+		if g, ok := gotFiles[p]; !ok {
+			t.Errorf("missing %s", p)
+		} else if g != w {
+			t.Errorf("%s = %q, want %q", p, g, w)
+		}
+	}
+	for p := range gotFiles {
+		if _, ok := wantFiles[p]; !ok {
+			t.Errorf("extra file %s", p)
+		}
+	}
+
+	ignored, err := os.ReadFile(filepath.Join(got, "ignored", "file"))
+	if cow && !bytes.Equal(ignored, []byte("ignored\n")) {
+		t.Errorf("gitignored file not cloned: %q, %v", ignored, err)
+	}
+	if !cow && err == nil {
+		t.Errorf("fallback checkout should not copy gitignored files")
 	}
 }
 
@@ -207,6 +220,38 @@ func TestNewWorktreePicksRequestedPathAmongConcurrentAdds(t *testing.T) {
 		id, dst := newWorktree(before, after, []string{"-b", "branch-" + want, want, "main"})
 		if id != want || dst != filepath.Join(root, want) {
 			t.Errorf("args for %s picked %s at %s", want, id, dst)
+		}
+	}
+}
+
+// TestRemoveLeftovers covers the last-resort path, where read-tree has already
+// replaced the cloned index: files it no longer tracks must go, along with
+// directories that leaves empty, while tracked and ignored files stay.
+func TestRemoveLeftovers(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	dir, err := pathutil.Canon(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, dir, "init", "-q")
+	write(t, filepath.Join(dir, "keep", "tracked.txt"), "tracked\n")
+	gitT(t, dir, "add", "-A")
+	write(t, filepath.Join(dir, "keep", "gone.txt"), "leftover\n")
+	write(t, filepath.Join(dir, "only", "deep", "gone.txt"), "leftover\n")
+	write(t, filepath.Join(dir, "keep", "ignored.log"), "ignored\n")
+
+	if err := removeLeftovers(dir, []string{"keep/tracked.txt", "keep/gone.txt", "only/deep/gone.txt", "missing.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"keep/gone.txt", "only"} {
+		if _, err := os.Stat(filepath.Join(dir, p)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s still exists (%v)", p, err)
+		}
+	}
+	for _, p := range []string{"keep/tracked.txt", "keep/ignored.log"} {
+		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {
+			t.Errorf("%s was removed: %v", p, err)
 		}
 	}
 }

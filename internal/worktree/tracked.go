@@ -1,7 +1,10 @@
 package worktree
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -11,8 +14,9 @@ import (
 )
 
 // maxTrackedFix caps how many paths we restore one by one; past that a plain
-// `reset --hard` over the whole tree is just as fast.
-const maxTrackedFix = 5000
+// `reset --hard` over the whole tree is just as fast. A var so tests can force
+// the full reset.
+var maxTrackedFix = 5000
 
 // trackedFix is the set of tracked paths whose cloned content or index entry
 // can differ from the target commit: the source's unstaged and staged changes,
@@ -75,16 +79,13 @@ func planTrackedFix(srcTop, dst string, skipped []string) trackedFix {
 	fix := trackedFix{target: target}
 	known := map[string]bool{}
 	flaggedList := ""
-	for _, e := range strings.Split(srcIndex, "\x00") {
-		if len(e) < 3 {
-			continue
-		}
-		p := e[2:]
+	paths, flagged := parseLsFilesV(srcIndex)
+	for _, p := range paths {
 		known[p] = true
-		if e[0] != 'H' {
-			fix.flagged = append(fix.flagged, p)
-			flaggedList += p + "\x00"
-		}
+	}
+	fix.flagged = flagged
+	for _, p := range flagged {
+		flaggedList += p + "\x00"
 	}
 	var err error
 	if targetTree, err = git.Output(srcTop, "ls-tree", "-r", "-z", "--name-only", target); err != nil {
@@ -114,16 +115,44 @@ func planTrackedFix(srcTop, dst string, skipped []string) trackedFix {
 	return fix
 }
 
+// parseLsFilesV splits `git ls-files -v -z` output into all paths and the
+// ones carrying a skip-worktree or assume-unchanged flag (any tag but "H").
+func parseLsFilesV(out string) (paths, flagged []string) {
+	for _, e := range strings.Split(out, "\x00") {
+		if len(e) < 3 {
+			continue
+		}
+		paths = append(paths, e[2:])
+		if e[0] != 'H' {
+			flagged = append(flagged, e[2:])
+		}
+	}
+	return paths, flagged
+}
+
+// clearFlags drops skip-worktree and assume-unchanged from paths in dst's
+// index. Copied from the source, they would make git skip or refuse to update
+// those entries.
+func clearFlags(dst string, flagged []string) error {
+	if len(flagged) == 0 {
+		return nil
+	}
+	for _, flag := range []string{"--no-skip-worktree", "--no-assume-unchanged"} {
+		if err := git.RunInput(dst, strings.Join(flagged, "\x00"), "update-index", flag, "-z", "--stdin"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // applyTrackedFix restores just the planned paths from the target commit, in
 // both the index and the worktree, then checks the whole index against the
 // target tree (cheap: it compares object ids, not files). Any doubt falls back
 // to a full `reset --hard`.
 func applyTrackedFix(dst string, fix trackedFix) error {
 	defer report.Trace(time.Now(), fmt.Sprintf("restore %d differing tracked paths", len(fix.paths)))
-	for _, flag := range []string{"--no-skip-worktree", "--no-assume-unchanged"} {
-		if fix.err == nil && len(fix.flagged) > 0 {
-			fix.err = git.RunInput(dst, strings.Join(fix.flagged, "\x00"), "update-index", flag, "-z", "--stdin")
-		}
+	if fix.err == nil {
+		fix.err = clearFlags(dst, fix.flagged)
 	}
 	if fix.err == nil && len(fix.paths) > 0 {
 		fix.err = git.RunInput(dst, strings.Join(fix.paths, "\x00"),
@@ -137,6 +166,17 @@ func applyTrackedFix(dst string, fix trackedFix) error {
 		return nil
 	}
 	report.Trace(time.Now(), fmt.Sprintf("  targeted restore not usable (%v); full reset", fix.err))
+	// The plan may have failed before clearing flags; reset refuses
+	// skip-worktree entries whose file differs, so clear them from dst's own
+	// index first.
+	cloned, err := git.Output(dst, "ls-files", "-v", "-z")
+	if err != nil {
+		return err
+	}
+	clonedPaths, flagged := parseLsFilesV(cloned)
+	if err := clearFlags(dst, flagged); err != nil {
+		return err
+	}
 	if git.Run(dst, "-c", "core.checkStat=minimal", "-c", "core.trustCtime=false", "reset", "-q", "--hard") == nil {
 		return nil
 	}
@@ -144,5 +184,35 @@ func applyTrackedFix(dst string, fix trackedFix) error {
 	if err := git.Run(dst, "read-tree", fix.target); err != nil {
 		return err
 	}
-	return git.Run(dst, "reset", "-q", "--hard")
+	if err := git.Run(dst, "reset", "-q", "--hard"); err != nil {
+		return err
+	}
+	// read-tree forgot the cloned index, so reset didn't delete the files
+	// that were tracked in the source but aren't in the target. Do it here.
+	return removeLeftovers(dst, clonedPaths)
+}
+
+// removeLeftovers deletes the given repo-relative paths that dst's index
+// doesn't track, then any directories that left empty.
+func removeLeftovers(dst string, paths []string) error {
+	out, err := git.Output(dst, "ls-files", "-z")
+	if err != nil {
+		return err
+	}
+	tracked := map[string]bool{}
+	for _, p := range strings.Split(out, "\x00") {
+		tracked[p] = true
+	}
+	for _, p := range paths {
+		if tracked[p] {
+			continue
+		}
+		full := filepath.Join(dst, filepath.FromSlash(p))
+		if err := os.Remove(full); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		for dir := filepath.Dir(full); dir != dst && os.Remove(dir) == nil; dir = filepath.Dir(dir) {
+		}
+	}
+	return nil
 }
