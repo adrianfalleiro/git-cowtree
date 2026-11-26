@@ -8,13 +8,15 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const ficlone = 0x40049409 // FICLONE ioctl (btrfs, XFS, bcachefs)
 
 // Tree reflinks src (a file, symlink or directory tree) to dst, which must not
 // exist. Linux has no directory clone, so files are reflinked one by one on a
-// worker pool. File mtimes are preserved, since git's index relies on them.
+// worker pool. File and symlink mtimes and permissions are preserved, since
+// git's index relies on them.
 func Tree(src, dst string) error {
 	info, err := os.Lstat(src)
 	if err != nil {
@@ -85,7 +87,10 @@ func cloneEntry(src, dst string, info fs.FileInfo) error {
 		if err != nil {
 			return err
 		}
-		return os.Symlink(target, dst)
+		if err := os.Symlink(target, dst); err != nil {
+			return err
+		}
+		return lchtimes(dst, info.ModTime())
 	case !info.Mode().IsRegular():
 		return nil // sockets, fifos, devices: skip
 	}
@@ -99,12 +104,41 @@ func cloneEntry(src, dst string, info fs.FileInfo) error {
 		return err
 	}
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, out.Fd(), ficlone, in.Fd())
-	if cerr := out.Close(); cerr != nil && errno == 0 {
-		return cerr
-	}
+	var err2 error
 	if errno != 0 {
+		err2 = errno
+	} else {
+		// OpenFile's mode is filtered through the umask; match the source.
+		err2 = out.Chmod(info.Mode().Perm())
+	}
+	if cerr := out.Close(); err2 == nil {
+		err2 = cerr
+	}
+	if err2 != nil {
 		os.Remove(dst)
-		return errno
+		return err2
 	}
 	return os.Chtimes(dst, time.Now(), info.ModTime())
+}
+
+// lchtimes sets the mtime of path itself, not of what it links to; os.Chtimes
+// follows symlinks.
+func lchtimes(path string, mtime time.Time) error {
+	const (
+		atFdcwd           = -0x64         // AT_FDCWD
+		utimeOmit         = (1 << 30) - 2 // UTIME_OMIT: leave atime alone
+		atSymlinkNofollow = 0x100         // AT_SYMLINK_NOFOLLOW
+	)
+	p, err := syscall.BytePtrFromString(path)
+	if err != nil {
+		return err
+	}
+	ts := [2]syscall.Timespec{{Nsec: utimeOmit}, syscall.NsecToTimespec(mtime.UnixNano())}
+	atFd := atFdcwd
+	_, _, errno := syscall.Syscall6(syscall.SYS_UTIMENSAT, uintptr(atFd), uintptr(unsafe.Pointer(p)),
+		uintptr(unsafe.Pointer(&ts[0])), atSymlinkNofollow, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }

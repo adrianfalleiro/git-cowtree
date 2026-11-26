@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"hash"
 	"os"
@@ -52,17 +53,7 @@ func RefreshStat(worktree, indexPath, objectFormat string, trustedBefore time.Ti
 	if objectFormat == "sha256" {
 		newHash = sha256.New
 	}
-	hashLen := newHash().Size()
-	if len(data) < 12+hashLen || string(data[:4]) != "DIRC" {
-		return 0, errors.New("not a git index")
-	}
 	be := binary.BigEndian
-	version := be.Uint32(data[4:])
-	if version < 2 || version > 4 {
-		return 0, errors.New("unsupported index version")
-	}
-	count := int(be.Uint32(data[8:]))
-	body := data[:len(data)-hashLen]
 	trustSec, trustNsec := trustedBefore.Unix(), int64(trustedBefore.Nanosecond())
 
 	type candidate struct {
@@ -70,55 +61,22 @@ func RefreshStat(worktree, indexPath, objectFormat string, trustedBefore time.Ti
 		path   string
 	}
 	var candidates []candidate
-	off := 12
-	var prevPath []byte
-	for range count {
-		e := off
-		pos := e + 40 + hashLen + 2
-		if pos > len(body) {
-			return 0, errors.New("truncated index")
-		}
-		flags := be.Uint16(data[e+40+hashLen:])
-		var extFlags uint16
-		if version >= 3 && flags&0x4000 != 0 {
-			extFlags = be.Uint16(data[pos:])
-			pos += 2
-		}
-
-		var path []byte
-		if version == 4 {
-			strip, n := readOffsetVarint(data[pos:])
-			if n == 0 || int(strip) > len(prevPath) {
-				return 0, errors.New("bad v4 path")
-			}
-			pos += n
-			end := bytes.IndexByte(data[pos:], 0)
-			if end < 0 {
-				return 0, errors.New("truncated index")
-			}
-			path = append(append([]byte{}, prevPath[:len(prevPath)-int(strip)]...), data[pos:pos+end]...)
-			off = pos + end + 1
-		} else {
-			end := bytes.IndexByte(data[pos:], 0)
-			if end < 0 {
-				return 0, errors.New("truncated index")
-			}
-			path = data[pos : pos+end]
-			off = e + (pos-e+end+8)&^7
-		}
-		prevPath = path
-
+	off, err := walkEntries(data, newHash().Size(), func(e int, path []byte, flags, extFlags uint16) {
 		mode := be.Uint32(data[e+24:])
 		const assumeValid, skipWorktree = 0x8000, 0x4000
 		if mode&sIFMT == gitlink || flags&assumeValid != 0 || extFlags&skipWorktree != 0 {
-			continue
+			return
 		}
 		mSec, mNsec := int64(be.Uint32(data[e+8:])), int64(be.Uint32(data[e+12:]))
 		if mSec > trustSec || (mSec == trustSec && mNsec >= trustNsec) {
-			continue
+			return
 		}
 		candidates = append(candidates, candidate{e, filepath.Join(worktree, string(path))})
+	})
+	if err != nil {
+		return 0, err
 	}
+	body := data[:len(data)-newHash().Size()]
 
 	// lstat the clones in parallel: it's the first touch of their metadata, so
 	// it's I/O-bound. Each chunk writes only its own entries' bytes.
@@ -166,6 +124,95 @@ func RefreshStat(worktree, indexPath, objectFormat string, trustedBefore time.Ti
 		off += 8 + size
 	}
 	return int(n.Load()), writeIndex(indexPath, out, newHash)
+}
+
+// walkEntries calls fn with the offset, path and flags of every entry in the
+// index data, and returns the offset of the first extension.
+func walkEntries(data []byte, hashLen int, fn func(offset int, path []byte, flags, extFlags uint16)) (int, error) {
+	if len(data) < 12+hashLen || string(data[:4]) != "DIRC" {
+		return 0, errors.New("not a git index")
+	}
+	be := binary.BigEndian
+	version := be.Uint32(data[4:])
+	if version < 2 || version > 4 {
+		return 0, errors.New("unsupported index version")
+	}
+	count := int(be.Uint32(data[8:]))
+	body := data[:len(data)-hashLen]
+	off := 12
+	var prevPath []byte
+	for range count {
+		e := off
+		pos := e + 40 + hashLen + 2
+		if pos > len(body) {
+			return 0, errors.New("truncated index")
+		}
+		flags := be.Uint16(data[e+40+hashLen:])
+		var extFlags uint16
+		if version >= 3 && flags&0x4000 != 0 {
+			if pos+2 > len(body) {
+				return 0, errors.New("truncated index")
+			}
+			extFlags = be.Uint16(data[pos:])
+			pos += 2
+		}
+
+		var path []byte
+		if version == 4 {
+			strip, n := readOffsetVarint(body[pos:])
+			if n == 0 || int(strip) > len(prevPath) {
+				return 0, errors.New("bad v4 path")
+			}
+			pos += n
+			end := bytes.IndexByte(body[pos:], 0)
+			if end < 0 {
+				return 0, errors.New("truncated index")
+			}
+			path = append(append([]byte{}, prevPath[:len(prevPath)-int(strip)]...), data[pos:pos+end]...)
+			off = pos + end + 1
+		} else {
+			end := bytes.IndexByte(body[pos:], 0)
+			if end < 0 {
+				return 0, errors.New("truncated index")
+			}
+			path = data[pos : pos+end]
+			off = e + (pos-e+end+8)&^7
+		}
+		prevPath = path
+		fn(e, path, flags, extFlags)
+	}
+	return off, nil
+}
+
+// SharedIndexID returns the object id of the shared index that the split
+// index at indexPath builds on (its sharedindex.<id> file sits next to it), or
+// "" if the index isn't split.
+func SharedIndexID(indexPath, objectFormat string) (string, error) {
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		return "", err
+	}
+	hashLen := sha1.Size
+	if objectFormat == "sha256" {
+		hashLen = sha256.Size
+	}
+	off, err := walkEntries(data, hashLen, func(int, []byte, uint16, uint16) {})
+	if err != nil {
+		return "", err
+	}
+	body := data[:len(data)-hashLen]
+	be := binary.BigEndian
+	for off+8 <= len(body) {
+		size := int(be.Uint32(data[off+4:]))
+		if off+8+size > len(body) {
+			return "", errors.New("truncated index extension")
+		}
+		if string(data[off:off+4]) == "link" && size >= hashLen {
+			return hex.EncodeToString(data[off+8 : off+8+hashLen]), nil
+		}
+		off += 8 + size
+	}
+	return "", nil
 }
 
 // readOffsetVarint decodes git's "offset" varint (varint.c), used by index v4.

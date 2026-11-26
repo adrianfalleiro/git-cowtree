@@ -29,6 +29,10 @@ func TestTree(t *testing.T) {
 	if err := os.Symlink("a.txt", filepath.Join(src, "link")); err != nil {
 		t.Fatal(err)
 	}
+	srcLink, err := os.Lstat(filepath.Join(src, "link"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	dst := filepath.Join(dir, "dst")
 	if err := Tree(src, dst); err != nil {
@@ -51,6 +55,9 @@ func TestTree(t *testing.T) {
 	}
 	if target, err := os.Readlink(filepath.Join(dst, "link")); err != nil || target != "a.txt" {
 		t.Errorf("symlink = %q, %v; want it cloned as a link to a.txt", target, err)
+	}
+	if info, err := os.Lstat(filepath.Join(dst, "link")); err != nil || !info.ModTime().Equal(srcLink.ModTime()) {
+		t.Errorf("symlink mtime = %v, want %v (git's index relies on it)", info.ModTime(), srcLink.ModTime())
 	}
 
 	// The clone is independent: writing to it leaves the source alone.

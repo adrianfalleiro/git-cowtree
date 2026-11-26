@@ -49,13 +49,31 @@ type sourceFacts struct {
 	installCommand string   // cowtree.installCommand
 }
 
+// PlainAdd reports whether `git worktree add <args>` has nothing to clone into
+// and should run as is: with --no-checkout the user wants no files, and an
+// --orphan worktree starts empty (git also refuses it with --no-checkout).
+func PlainAdd(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "--":
+			return false
+		case "--no-checkout", "--orphan", "-h", "--help":
+			return true
+		}
+	}
+	return false
+}
+
 // Add runs `git worktree add --no-checkout <args>` from the current directory,
 // then fills the new worktree from the source worktree: everything is cloned
 // copy-on-write, and only tracked files that differ from the new HEAD are
 // rewritten. It returns the new worktree's path, or "" if git created none
-// (for example with --help).
+// (for example with --help) or Add left the work to plain git (see PlainAdd).
 func Add(args []string, opts Options) (string, error) {
 	t0 := time.Now()
+	if PlainAdd(args) {
+		return "", git.Run(".", append([]string{"worktree", "add"}, args...)...)
+	}
 	dir := opts.Source
 	if dir == "" {
 		dir = "."
@@ -70,8 +88,21 @@ func Add(args []string, opts Options) (string, error) {
 		return "", err
 	}
 	src.commonDir, src.index, src.objectFormat = lines[1], lines[2], lines[3]
+	if opts.Source != "" {
+		// git creates the worktree in the repository of the current directory,
+		// which must be the one we clone from.
+		here, err := git.Output(".", "rev-parse", "--path-format=absolute", "--git-common-dir")
+		if err != nil {
+			return "", err
+		}
+		a, errA := pathutil.Canon(here)
+		b, errB := pathutil.Canon(src.commonDir)
+		if errA != nil || errB != nil || a != b {
+			return "", fmt.Errorf("COWTREE_SOURCE %s is not a worktree of the repository in the current directory", opts.Source)
+		}
+	}
 
-	before := git.LinkedWorktrees(src.commonDir)
+	before := adminDirs(src.commonDir)
 	var facts sourceFacts
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -82,9 +113,9 @@ func Add(args []string, opts Options) (string, error) {
 		return "", addErr
 	}
 
-	id, dst := newWorktree(before, git.LinkedWorktrees(src.commonDir), args)
+	id, dst := newWorktree(src.commonDir, before, args)
 	if id == "" {
-		return "", nil
+		return "", errors.New("cannot tell which worktree git just created; it was left without a checkout")
 	}
 	dstIndex := filepath.Join(src.commonDir, "worktrees", id, "index")
 
@@ -103,17 +134,37 @@ func Add(args []string, opts Options) (string, error) {
 	return dst, nil
 }
 
-func newWorktree(before, after map[string]string, args []string) (id, dst string) {
+// adminDirs records the identity of each registered worktree's gitdir file
+// (<commonDir>/worktrees/<id>/gitdir), keyed by worktree id.
+func adminDirs(commonDir string) map[string]os.FileInfo {
+	ids := map[string]os.FileInfo{}
+	entries, _ := os.ReadDir(filepath.Join(commonDir, "worktrees"))
+	for _, e := range entries {
+		if info, err := os.Stat(filepath.Join(commonDir, "worktrees", e.Name(), "gitdir")); err == nil {
+			ids[e.Name()] = info
+		}
+	}
+	return ids
+}
+
+// newWorktree finds the worktree `git worktree add <args>` just registered:
+// an id that wasn't there before, or one whose gitdir file was rewritten
+// (`add -f` over a missing worktree reuses its id). If several appeared, as
+// with concurrent adds, it picks the one at a path named in args.
+func newWorktree(commonDir string, before map[string]os.FileInfo, args []string) (id, dst string) {
 	wanted := map[string]bool{}
 	for _, a := range args {
 		if c, err := pathutil.Canon(a); err == nil {
 			wanted[c] = true
 		}
 	}
+	after := adminDirs(commonDir)
 	var only []string
-	for k, p := range after {
-		if _, ok := before[k]; ok {
-			continue
+	for k, p := range git.LinkedWorktrees(commonDir) {
+		if old, ok := before[k]; ok {
+			if cur, ok := after[k]; !ok || (os.SameFile(old, cur) && old.ModTime().Equal(cur.ModTime())) {
+				continue
+			}
 		}
 		c, err := pathutil.Canon(p)
 		if err != nil {
@@ -217,7 +268,8 @@ func populate(src source, dst, dstIndex string, facts sourceFacts) error {
 	if err != nil {
 		return err
 	}
-	if failed := cloneAll(pairs); failed > 0 {
+	failed := cloneAll(pairs)
+	if failed > 0 {
 		report.Errorf("%d clone(s) failed; tracked files will still be checked out normally", failed)
 	}
 	report.Logf("cloned %s -> %s in %s", src.top, dst, time.Since(start).Round(time.Millisecond))
@@ -230,15 +282,23 @@ func populate(src source, dst, dstIndex string, facts sourceFacts) error {
 	if info, err := os.Stat(src.index); err == nil {
 		srcIndexTime = info.ModTime()
 	}
-	os.Remove(dstIndex)
-	if err := clone.Tree(src.index, dstIndex); err != nil && !errors.Is(err, os.ErrNotExist) {
-		if data, err := os.ReadFile(src.index); err == nil {
-			if err := os.WriteFile(dstIndex, data, 0o644); err != nil {
-				return err
-			}
+	if err := copyFile(src.index, dstIndex); err != nil {
+		return err
+	}
+	// A split index needs its shared index, which lives beside it in the
+	// per-worktree git dir.
+	if shared, err := gitindex.SharedIndexID(dstIndex, src.objectFormat); err == nil && shared != "" {
+		name := "sharedindex." + shared
+		if err := copyFile(filepath.Join(filepath.Dir(src.index), name), filepath.Join(filepath.Dir(dstIndex), name)); err != nil {
+			return err
 		}
 	}
-	if err := applyTrackedFix(dst, <-fixCh); err != nil {
+	fix := <-fixCh
+	if failed > 0 && fix.err == nil {
+		// The index vouches for files that may not have been cloned.
+		fix.err = fmt.Errorf("%d clone(s) failed", failed)
+	}
+	if err := applyTrackedFix(dst, fix); err != nil {
 		return err
 	}
 	// Then make the index trust the clones under git's normal stat checks too,
@@ -252,6 +312,21 @@ func populate(src source, dst, dstIndex string, facts sourceFacts) error {
 		return git.Run(dst, "clean", "-fdq")
 	}
 	return nil
+}
+
+// copyFile replaces dst with a clone of src, or a plain copy where cloning
+// isn't possible. A missing src is not an error.
+func copyFile(src, dst string) error {
+	os.Remove(dst)
+	err := clone.Tree(src, dst)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return nil
+	}
+	return os.WriteFile(dst, data, 0o644)
 }
 
 type clonePair struct{ src, dst string }

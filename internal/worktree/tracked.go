@@ -115,15 +115,19 @@ func planTrackedFix(srcTop, dst string, skipped []string) trackedFix {
 	return fix
 }
 
-// parseLsFilesV splits `git ls-files -v -z` output into all paths and the
-// ones carrying a skip-worktree or assume-unchanged flag (any tag but "H").
+// parseLsFilesV splits `git ls-files -v -z` output into all paths (each once,
+// though an unmerged path is listed per stage) and the ones carrying a
+// skip-worktree ("S") or assume-unchanged (lowercase) flag. Unmerged entries
+// ("M") carry no flag, and update-index refuses to touch them.
 func parseLsFilesV(out string) (paths, flagged []string) {
+	seen := map[string]bool{}
 	for _, e := range strings.Split(out, "\x00") {
-		if len(e) < 3 {
+		if len(e) < 3 || seen[e[2:]] {
 			continue
 		}
+		seen[e[2:]] = true
 		paths = append(paths, e[2:])
-		if e[0] != 'H' {
+		if tag := e[0]; tag == 'S' || ('a' <= tag && tag <= 'z' && tag != 'm') {
 			flagged = append(flagged, e[2:])
 		}
 	}

@@ -17,6 +17,8 @@ func TestClassifyShim(t *testing.T) {
 		{"-C /repo -C sub worktree add ../x", false, addWorktree, []string{"/repo", "sub"}},
 		{"worktree add --no-checkout ../x", false, passThrough, nil},
 		{"worktree add -h", false, passThrough, nil},
+		{"worktree add --orphan -b x ../x", false, passThrough, nil},
+		{"worktree add -b x ../x -- --orphan", false, addWorktree, nil},
 		{"worktree list", false, passThrough, nil},
 		{"worktree add ../x", true, passThrough, nil},
 		{"checkout main", false, checkoutSync, nil},

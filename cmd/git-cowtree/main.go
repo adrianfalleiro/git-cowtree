@@ -40,6 +40,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"syscall"
 
 	"github.com/adrianfalleiro/git-cowtree/internal/git"
 	"github.com/adrianfalleiro/git-cowtree/internal/report"
@@ -112,9 +113,18 @@ func exit(err error) {
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		os.Exit(ee.ExitCode())
+		os.Exit(exitStatus(ee))
 	}
 	report.Fatalf("%v", err)
+}
+
+// exitStatus is the status a shell would report for a finished git: its exit
+// code, or 128+n if signal n killed it (ExitCode says -1 then).
+func exitStatus(ee *exec.ExitError) int {
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return 128 + int(ws.Signal())
+	}
+	return ee.ExitCode()
 }
 
 func selfPath() (string, error) {

@@ -27,3 +27,23 @@ jobs:
           GOOS=linux GOARCH=arm64 go build ./...
           GOOS=darwin GOARCH=amd64 go build ./...
           GOOS=windows go build ./...
+
+  # The Linux reflink path, on an XFS loop mount (the runner's ext4 can't clone).
+  test-linux-reflink:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Mount XFS with reflinks
+        run: |
+          sudo apt-get install -y -qq xfsprogs
+          truncate -s 1G "$RUNNER_TEMP/xfs.img"
+          mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/xfs.img"
+          sudo mkdir -p /mnt/cow
+          sudo mount -o loop "$RUNNER_TEMP/xfs.img" /mnt/cow
+          sudo chown "$(id -u):$(id -g)" /mnt/cow
+      - run: go test ./...
+        env:
+          TMPDIR: /mnt/cow

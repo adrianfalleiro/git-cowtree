@@ -37,6 +37,8 @@ git cowtree add ../feature -b feature origin/main
 
 `git cowtree add` takes the same arguments as `git worktree add`. The result is
 an ordinary git worktree: commit, switch branches and remove it as usual.
+With `--no-checkout` or `--orphan` there is nothing to clone, so it runs plain
+`git worktree add`.
 
 ### With plain `git`
 

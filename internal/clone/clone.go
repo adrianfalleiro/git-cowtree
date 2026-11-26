@@ -18,7 +18,8 @@ var ErrUnsupported = errors.New("copy-on-write cloning not supported on this pla
 // It checks by cloning a throwaway file.
 func Possible(src, dst string) bool {
 	probe := filepath.Join(src, fmt.Sprintf(".cowtree-probe.%d", os.Getpid()))
-	target := filepath.Join(dst, filepath.Base(probe))
+	// A distinct name, so src and dst may be the same directory.
+	target := filepath.Join(dst, filepath.Base(probe)+".clone")
 	defer os.Remove(probe)
 	defer os.Remove(target)
 	if err := os.WriteFile(probe, nil, 0o600); err != nil {

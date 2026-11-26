@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"strings"
 	"syscall"
 
@@ -40,8 +39,7 @@ func classifyShim(args []string, disabled bool) (shimAction, []string, []string)
 	switch {
 	case disabled || len(rest) == 0:
 		return passThrough, chdirs, rest
-	case len(rest) >= 2 && rest[0] == "worktree" && rest[1] == "add" &&
-		!slices.ContainsFunc(rest[2:], func(a string) bool { return a == "--no-checkout" || a == "-h" || a == "--help" }):
+	case len(rest) >= 2 && rest[0] == "worktree" && rest[1] == "add" && !worktree.PlainAdd(rest[2:]):
 		return addWorktree, chdirs, rest
 	case rest[0] == "checkout" || rest[0] == "switch":
 		return checkoutSync, chdirs, rest
@@ -81,7 +79,7 @@ func checkoutThenSync(args, chdirs []string) int {
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			return ee.ExitCode()
+			return exitStatus(ee)
 		}
 		report.Fatalf("%v", err)
 	}
