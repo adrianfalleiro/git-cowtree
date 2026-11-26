@@ -5,6 +5,7 @@
 //
 //	git cowtree add [<git worktree add options>] <path> [<commit-ish>]
 //	git cowtree install-shim [<dir>]  # make plain `git worktree add` use it
+//	git cowtree claude-hook create|remove  # Claude Code WorktreeCreate/Remove hooks
 //	git cowtree version               # print the version
 //	git cowtree <anything else>       # passed straight to `git worktree`
 //
@@ -29,6 +30,7 @@
 //
 //	git config --add cowtree.exclude .venv   # never clone these paths (repeatable)
 //	git config cowtree.install never         # pnpm: auto (default) | always | never
+//	git config cowtree.claudeBase main       # claude-hook: branch new worktrees from here
 //	git config cowtree.installCommand '...'  # default: pnpm install
 //	                                         #   --frozen-lockfile --prefer-offline
 package main
@@ -50,12 +52,13 @@ import (
 const usage = `usage:
   git cowtree add [<git worktree add options>] <path> [<commit-ish>]
   git cowtree install-shim [<dir>]  make plain 'git worktree add' use copy-on-write
+  git cowtree claude-hook           Claude Code worktree hooks (run it to see the settings)
   git cowtree version               print the version
   git cowtree <anything else>       passed straight to 'git worktree'
 
 env:    COWTREE_SOURCE, COWTREE_KEEP_UNTRACKED, COWTREE_DISABLE, COWTREE_REAL_GIT,
         COWTREE_WORKERS, COWTREE_QUIET, COWTREE_TRACE
-config: cowtree.exclude, cowtree.install, cowtree.installCommand
+config: cowtree.exclude, cowtree.install, cowtree.installCommand, cowtree.claudeBase
 `
 
 // version is set at release build time with -ldflags "-X main.version=v1.2.3".
@@ -91,6 +94,8 @@ func main() {
 		exit(err)
 	case "install-shim":
 		exit(installShim(args[1:]))
+	case "claude-hook":
+		exit(claudeHook(args[1:], os.Stdin, os.Stdout))
 	default:
 		cmd := exec.Command(git.Bin, append([]string{"worktree"}, args...)...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -114,6 +119,9 @@ func exit(err error) {
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
 		os.Exit(exitStatus(ee))
+	}
+	if errors.Is(err, worktree.ErrInterrupted) {
+		os.Exit(130) // what a shell reports for SIGINT
 	}
 	report.Fatalf("%v", err)
 }

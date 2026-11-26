@@ -69,6 +69,9 @@ func PlainAdd(args []string) bool {
 // copy-on-write, and only tracked files that differ from the new HEAD are
 // rewritten. It returns the new worktree's path, or "" if git created none
 // (for example with --help) or Add left the work to plain git (see PlainAdd).
+//
+// If the worktree can't be filled, or Ctrl-C arrives first, Add removes it
+// again, along with its branch if git created that branch for it.
 func Add(args []string, opts Options) (string, error) {
 	t0 := time.Now()
 	if PlainAdd(args) {
@@ -102,14 +105,24 @@ func Add(args []string, opts Options) (string, error) {
 		}
 	}
 
+	// From here until the worktree is filled, Ctrl-C removes it instead of
+	// leaving it half-made. git, in our process group, gets the signal too.
+	stop, release := catchInterrupt()
+	defer release()
+
 	before := adminDirs(src.commonDir)
 	var facts sourceFacts
+	var branchesBefore map[string]bool
 	var wg sync.WaitGroup
-	wg.Add(1)
+	wg.Add(2)
 	go func() { defer wg.Done(); facts = querySource(src.top, opts.KeepUntracked) }()
+	go func() { defer wg.Done(); branchesBefore = localBranches(src.top) }()
 	addErr := git.Run(".", append([]string{"worktree", "add", "--no-checkout"}, args...)...)
 	wg.Wait()
 	if addErr != nil {
+		if stop.Load() {
+			return "", ErrInterrupted
+		}
 		return "", addErr
 	}
 
@@ -122,9 +135,18 @@ func Add(args []string, opts Options) (string, error) {
 	plan := pnpm.PlanClone(src.top, dst, facts.install, src.objectFormat)
 	facts.excludes = append(facts.excludes, plan.Skip...)
 	facts.mayHoldTracked = append(facts.mayHoldTracked, plan.Skip...)
-	if err := populate(src, dst, dstIndex, facts); err != nil {
-		return dst, err
+	err = populateFn(src, dst, dstIndex, facts, stop)
+	if err == nil && stop.Load() {
+		err = ErrInterrupted
 	}
+	if err != nil {
+		rollback(src, id, dst, branchesBefore)
+		if stop.Load() {
+			return "", ErrInterrupted
+		}
+		return "", err
+	}
+	release() // complete: a Ctrl-C during the install below just stops it
 	runPostCheckout(src, dst, facts.hooksPath)
 	if err := pnpm.SyncInstall(dst, facts.install, facts.installCommand, plan.FreshInstall); err != nil {
 		report.Errorf("warning: %v", err)
@@ -241,8 +263,12 @@ func querySource(top string, keepUntracked bool) sourceFacts {
 	return facts
 }
 
+// populateFn is populate, replaceable in tests.
+var populateFn = populate
+
 // populate fills the (--no-checkout) worktree dst from the source worktree.
-func populate(src source, dst, dstIndex string, facts sourceFacts) error {
+// It gives up early, returning ErrInterrupted, once stop is set.
+func populate(src source, dst, dstIndex string, facts sourceFacts, stop *atomic.Bool) error {
 	if !clone.Possible(src.top, dst) {
 		report.Logf("copy-on-write not available between %s and %s; doing a normal checkout", src.top, dst)
 		return git.Run(dst, "reset", "-q", "--hard")
@@ -268,7 +294,11 @@ func populate(src source, dst, dstIndex string, facts sourceFacts) error {
 	if err != nil {
 		return err
 	}
-	failed := cloneAll(pairs)
+	failed := cloneAll(pairs, stop)
+	if stop.Load() {
+		<-fixCh // let its git commands finish before the worktree goes
+		return ErrInterrupted
+	}
 	if failed > 0 {
 		report.Errorf("%d clone(s) failed; tracked files will still be checked out normally", failed)
 	}
@@ -376,10 +406,13 @@ func planClones(src, dst string, excluded map[string]bool) ([]clonePair, error) 
 }
 
 // cloneAll runs the clones in parallel and returns how many failed.
-func cloneAll(pairs []clonePair) int {
+func cloneAll(pairs []clonePair, stop *atomic.Bool) int {
 	defer report.Trace(time.Now(), fmt.Sprintf("clone %d entries", len(pairs)))
 	var failed atomic.Int64
 	parallel.ForEach(pairs, func(p clonePair) {
+		if stop.Load() {
+			return
+		}
 		start := time.Now()
 		err := clone.Tree(p.src, p.dst)
 		if time.Since(start) > 200*time.Millisecond {

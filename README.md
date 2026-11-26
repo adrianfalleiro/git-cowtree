@@ -38,7 +38,9 @@ git cowtree add ../feature -b feature origin/main
 `git cowtree add` takes the same arguments as `git worktree add`. The result is
 an ordinary git worktree: commit, switch branches and remove it as usual.
 With `--no-checkout` or `--orphan` there is nothing to clone, so it runs plain
-`git worktree add`.
+`git worktree add`. If filling the worktree fails, or you press Ctrl-C,
+the half-made worktree is removed again, along with the branch if git created
+one for it.
 
 ### With plain `git`
 
@@ -54,7 +56,34 @@ The shim is the same binary, linked as `git` ahead of the real one on your
 git. Tools that run `git` from your `PATH`, such as editors and worktree
 managers, pick it up too. Set `COWTREE_DISABLE=1` to bypass it for a command.
 
-### With pnpm
+### With Claude Code
+
+Claude Code can create its worktrees (`claude --worktree`, subagents with
+`isolation: "worktree"`, background sessions) through git-cowtree, so agents
+start with your dependencies already in place. Add this to
+`.claude/settings.json` (or `~/.claude/settings.json` for every project).
+`git-cowtree claude-hook` prints the same snippet:
+
+```json
+{
+  "hooks": {
+    "WorktreeCreate": [
+      { "hooks": [{ "type": "command", "command": "git-cowtree claude-hook create" }] }
+    ],
+    "WorktreeRemove": [
+      { "hooks": [{ "type": "command", "command": "git-cowtree claude-hook remove" }] }
+    ]
+  }
+}
+```
+
+Worktrees go where Claude Code puts its own, `.claude/worktrees/<name>`, on a
+branch `worktree-<name>` that starts from `origin`'s default branch (set
+`git config cowtree.claudeBase <commit-ish>` to change that). Add
+`.claude/worktrees/` to your `.gitignore`. When Claude Code removes the
+worktree, its branch is deleted too, unless it has commits that aren't merged.
+
+
 
 A cloned `node_modules` is adjusted to work from its new location. If the branch
 you're creating the worktree for has a different `pnpm-lock.yaml` from the one
@@ -96,6 +125,7 @@ The new worktree contains:
 | `git config --add cowtree.exclude <path>` | Never clone this path, e.g. a Python `.venv` that stores absolute paths. Repeatable. |
 | `git config cowtree.install <auto\|always\|never>` | When to run `pnpm install`. Default `auto`: only when the lockfile differs. |
 | `git config cowtree.installCommand '<command>'` | Command to install dependencies with, instead of `pnpm install`. |
+| `git config cowtree.claudeBase <commit-ish>` | Where `claude-hook create` starts new branches. Default: `origin`'s default branch, else `HEAD`. |
 | `COWTREE_SOURCE=<dir>` | Worktree to clone from, instead of the current one. |
 | `COWTREE_KEEP_UNTRACKED=1` | Also copy untracked files. |
 | `COWTREE_DISABLE=1` | Make the shim behave exactly like plain git. |

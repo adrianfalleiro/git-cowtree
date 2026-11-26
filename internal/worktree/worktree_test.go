@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -411,4 +413,73 @@ func TestAddRejectsSourceFromAnotherRepo(t *testing.T) {
 	if _, err := os.Stat(dst); err == nil {
 		t.Errorf("a worktree was created at %s", dst)
 	}
+}
+
+// failPopulate makes Add's fill step fail, after doing fn.
+func failPopulate(t *testing.T, fn func()) {
+	t.Helper()
+	orig := populateFn
+	t.Cleanup(func() { populateFn = orig })
+	populateFn = func(src source, dst, dstIndex string, facts sourceFacts, stop *atomic.Bool) error {
+		write(t, filepath.Join(dst, "partial.txt"), "half done\n")
+		fn()
+		return errors.New("fill failed")
+	}
+}
+
+func checkRolledBack(t *testing.T, src, dst string) {
+	t.Helper()
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("worktree %s still exists (%v)", dst, err)
+	}
+	if list := gitT(t, src, "worktree", "list", "--porcelain"); strings.Contains(list, dst) {
+		t.Errorf("worktree still registered:\n%s", list)
+	}
+}
+
+func TestAddRollsBackOnFailure(t *testing.T) {
+	root, src := newRepo(t)
+	gitT(t, src, "branch", "existing")
+	failPopulate(t, func() {})
+	for _, tc := range []struct {
+		args       []string
+		branch     string
+		keepBranch bool
+	}{
+		{[]string{"-q", "-b", "created"}, "created", false},
+		{[]string{"-q"}, "guessed", false}, // git creates a branch named after the path
+		{[]string{"-q"}, "existing", true},
+	} {
+		dst := filepath.Join(root, tc.branch)
+		args := append(tc.args, dst)
+		if tc.keepBranch {
+			args = append(args, "existing")
+		}
+		if _, err := Add(args, Options{}); err == nil {
+			t.Fatalf("%s: Add succeeded", tc.branch)
+		}
+		checkRolledBack(t, src, dst)
+		err := exec.Command(git.Bin, "-C", src, "rev-parse", "-q", "--verify", "refs/heads/"+tc.branch).Run()
+		if tc.keepBranch && err != nil {
+			t.Errorf("pre-existing branch %s was deleted", tc.branch)
+		}
+		if !tc.keepBranch && err == nil {
+			t.Errorf("branch %s created for the worktree was kept", tc.branch)
+		}
+	}
+}
+
+func TestAddRollsBackOnInterrupt(t *testing.T) {
+	root, src := newRepo(t)
+	failPopulate(t, func() {
+		if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond) // let the signal arrive
+	})
+	dst := filepath.Join(root, "wt")
+	if _, err := Add([]string{"-q", "-b", "wt", dst}, Options{}); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("Add = %v, want ErrInterrupted", err)
+	}
+	checkRolledBack(t, src, dst)
 }
