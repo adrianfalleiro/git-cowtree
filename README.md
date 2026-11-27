@@ -141,6 +141,8 @@ installed version.
 go test ./...
 ```
 
-Tests need `git` on your `PATH`. `scripts/git-cowtree.sh` is an older Bash
-version; see [scripts/README.md](scripts/README.md). Pushing a tag like `v0.1.0` publishes a release
-with binaries for macOS and Linux.
+Tests need `git` on your `PATH`. Pushing a tag like `v0.1.0` publishes a
+release with binaries for macOS and Linux.
+
+`scripts/git-cowtree.sh` is an older Bash version; see
+[scripts/README.md](scripts/README.md).
